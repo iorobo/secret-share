@@ -1,0 +1,270 @@
+import { useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import { QRCodeSVG } from 'qrcode.react';
+import { ExpirationSelector } from '@shared/components/ExpirationSelector';
+import {
+  expirationForSubmission,
+  initialExpiration,
+  validExpiration,
+} from '@shared/lib/expiration';
+import { useConfig } from '@shared/hooks/useConfig';
+import { useCopy } from '@shared/hooks/useCopy';
+import { generateRequestKeyPair } from '@shared/lib/crypto';
+import { createSecretRequest } from '@shared/lib/api';
+import { saveStoredRequest } from '@shared/lib/requestStore';
+import { CheckCircleIcon, InfoIcon } from '@shared/components/icons';
+import { requestLink, shortFingerprint } from './requestLink';
+import ValueBox from '@shared/components/ValueBox';
+
+interface CreatedRequest {
+  id: string;
+  fingerprint: string;
+  expiresAt: number;
+}
+
+export default function CreateRequest() {
+  const { t } = useTranslation();
+  const config = useConfig();
+  const [label, setLabel] = useState('');
+  const [note, setNote] = useState('');
+  const maxNoteLength = config.MAX_REQUEST_NOTE_LENGTH;
+  // Counted like the server: trimmed, in code points (not UTF-16 units, which
+  // is what textarea maxLength would count). Over the limit, the counter turns
+  // red and submit is disabled instead of cutting off what was typed.
+  const noteLength = Array.from(note.trim()).length;
+  const noteTooLong = Boolean(maxNoteLength && noteLength > maxNoteLength);
+  const [expiration, setExpiration] = useState(initialExpiration(config));
+  const [error, setError] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [created, setCreated] = useState<CreatedRequest | null>(null);
+  const { copy, isCopied } = useCopy();
+  const [showQr, setShowQr] = useState(false);
+
+  async function onSubmit(e: React.FormEvent) {
+    e.preventDefault();
+    setError('');
+    if (!validExpiration(expiration, config)) {
+      setError(
+        t('expiration.invalid', {
+          min: config.MIN_EXPIRATION + 's',
+          max: config.MAX_EXPIRATION + 's',
+        }),
+      );
+      return;
+    }
+    setSubmitting(true);
+    try {
+      const keyPair = await generateRequestKeyPair();
+      const ttl = expirationForSubmission(expiration, config);
+      if (ttl === undefined) {
+        setError(
+          t('expiration.invalid', {
+            min: config.MIN_EXPIRATION + 's',
+            max: config.MAX_EXPIRATION + 's',
+          }),
+        );
+        return;
+      }
+      const { data, message } = await createSecretRequest(
+        {
+          public_key: keyPair.publicKey,
+          label: label.trim() || undefined,
+          note: (maxNoteLength && note.trim()) || undefined,
+          expiration: ttl,
+        },
+        config.OIDC_ENABLED,
+      );
+      if (!data) {
+        setError(message || t('request.errorCreateFailed'));
+        return;
+      }
+      saveStoredRequest({
+        id: data.id,
+        label: label.trim() || undefined,
+        privateKey: keyPair.privateKey,
+        publicKey: keyPair.publicKey,
+        fingerprint: keyPair.fingerprint,
+        token: data.token,
+        createdAt: Math.floor(Date.now() / 1000),
+        expiresAt: data.expires_at,
+      });
+      setCreated({
+        id: data.id,
+        fingerprint: keyPair.fingerprint,
+        expiresAt: data.expires_at,
+      });
+    } catch {
+      setError(t('request.errorCreateFailed'));
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  if (created) {
+    const link = requestLink(
+      config.PUBLIC_URL,
+      created.id,
+      shortFingerprint(created.fingerprint),
+    );
+    return (
+      <>
+        <div className="flex items-center gap-3 mb-2">
+          <CheckCircleIcon className="h-7 w-7 text-success animate-result-icon" />
+          <h2 className="text-2xl font-medium tracking-tight animate-result-enter">
+            {t('request.resultTitle')}
+          </h2>
+        </div>
+        <p
+          className="mb-6 text-base animate-result-enter"
+          style={{ animationDelay: '50ms' }}
+        >
+          {t('request.resultSubtitle')}
+        </p>
+        <div
+          className="mb-4 p-5 bg-base-200/50 border border-base-300 rounded-lg animate-result-enter"
+          style={{ animationDelay: '120ms' }}
+        >
+          <div className="font-semibold text-base mb-1 text-base-content">
+            {t('request.resultLinkLabel')}
+          </div>
+          <div className="text-sm text-base-content/70 mb-4">
+            {t('request.resultLinkDescription')}
+          </div>
+          <div className="flex items-start gap-3">
+            <button
+              className={`btn btn-sm font-medium transition-all duration-200 shrink-0 mt-1 ${isCopied() ? 'btn-success' : 'btn-primary'}`}
+              onClick={() => copy(link)}
+            >
+              {isCopied() ? t('common.copied') : t('common.copy')}
+            </button>
+            <ValueBox value={link} />
+          </div>
+          <button
+            className="btn btn-ghost btn-sm mt-3"
+            onClick={() => setShowQr(!showQr)}
+          >
+            {showQr ? t('secret.hideQrCode') : t('secret.showQrCode')}
+          </button>
+          {showQr && (
+            <div className="flex justify-center mt-3 p-4 bg-white rounded-lg w-fit mx-auto">
+              <QRCodeSVG value={link} size={180} />
+            </div>
+          )}
+        </div>
+        <div className="alert alert-info shadow-sm mb-6">
+          <InfoIcon className="w-6 h-6 shrink-0" />
+          <span className="text-sm">{t('request.resultKeyNotice')}</span>
+        </div>
+        <div className="flex justify-center gap-3">
+          <a href="#/requests" className="btn btn-primary px-8 font-medium">
+            {t('request.buttonGoToList')}
+          </a>
+          <button
+            className="btn btn-ghost px-8 font-medium"
+            onClick={() => {
+              setCreated(null);
+              setLabel('');
+              setNote('');
+            }}
+          >
+            {t('request.buttonCreateAnother')}
+          </button>
+        </div>
+      </>
+    );
+  }
+
+  return (
+    <>
+      <h2 className="text-3xl font-medium tracking-tight mb-2">
+        {t('request.createTitle')}
+      </h2>
+      <p className="text-base text-base-content/70 mb-6">
+        {t('request.createSubtitle')}
+      </p>
+      <form onSubmit={onSubmit}>
+        {error && (
+          <div
+            role="alert"
+            className="alert alert-error mb-4 animate-alert-enter"
+          >
+            <span>{error}</span>
+          </div>
+        )}
+        <div className="form-control">
+          <label className="label" htmlFor="request-label">
+            <span className="label-text">{t('request.inputLabelLabel')}</span>
+          </label>
+          <input
+            id="request-label"
+            dir="ltr"
+            type="text"
+            maxLength={100}
+            className="content-input input input-bordered w-full text-base focus:outline-none focus:border-primary focus:ring-2 focus:ring-primary/20 bg-base-100"
+            value={label}
+            onChange={e => setLabel(e.target.value)}
+            placeholder={t('request.inputLabelPlaceholder')}
+          />
+          <p className="text-xs text-base-content/60 mt-2">
+            {t('request.inputLabelHint')}
+          </p>
+        </div>
+        {maxNoteLength ? (
+          <div className="form-control mt-4">
+            <label className="label" htmlFor="request-note">
+              <span className="label-text">{t('request.inputNoteLabel')}</span>
+            </label>
+            <textarea
+              id="request-note"
+              dir="ltr"
+              rows={3}
+              className="content-input textarea textarea-bordered w-full text-base focus:outline-none focus:border-primary focus:ring-2 focus:ring-primary/20 bg-base-100"
+              value={note}
+              onChange={e => setNote(e.target.value)}
+              placeholder={t('request.inputNotePlaceholder')}
+              aria-describedby="request-note-hint"
+              aria-invalid={noteTooLong}
+            />
+            <div
+              id="request-note-hint"
+              className="flex justify-between gap-4 text-xs text-base-content/60 mt-2"
+            >
+              <span>{t('request.inputNoteHint')}</span>
+              <span
+                data-testid="request-note-count"
+                className={`shrink-0 tabular-nums${noteTooLong ? ' text-error font-semibold' : ''}`}
+              >
+                {noteLength}/{maxNoteLength}
+              </span>
+            </div>
+          </div>
+        ) : null}
+        <ExpirationSelector value={expiration} onChange={setExpiration} />
+        <div className="form-control mt-8">
+          <button
+            className="btn btn-primary w-full h-12 text-base font-semibold transition-all duration-200"
+            type="submit"
+            disabled={submitting || noteTooLong}
+          >
+            {submitting && <span className="loading loading-spinner" />}
+            <svg
+              xmlns="http://www.w3.org/2000/svg"
+              className="h-6 w-6 me-2"
+              fill="none"
+              viewBox="0 0 24 24"
+              stroke="currentColor"
+            >
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                strokeWidth={2}
+                d="M21.75 9v.906a2.25 2.25 0 0 1-1.183 1.981l-6.478 3.488M2.25 9v.906a2.25 2.25 0 0 0 1.183 1.981l6.478 3.488m8.839 2.51-4.66-2.51m0 0-1.023-.55a2.25 2.25 0 0 0-2.134 0l-1.022.55m0 0-4.661 2.51m16.5 1.615a2.25 2.25 0 0 1-2.25 2.25h-15a2.25 2.25 0 0 1-2.25-2.25V6.75A2.25 2.25 0 0 1 4.5 4.5h15a2.25 2.25 0 0 1 2.25 2.25v10.5Z"
+              />
+            </svg>
+            {t('request.buttonCreate')}
+          </button>
+        </div>
+      </form>
+    </>
+  );
+}

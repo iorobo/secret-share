@@ -1,0 +1,352 @@
+name: Test
+# yamllint disable-line rule:truthy
+on:
+  pull_request: {}
+  # Codecov needs master uploads as the comparison base for PRs.
+  push:
+    branches: [master]
+jobs:
+  go:
+    name: Go Test
+    runs-on: ubuntu-latest
+    services:
+      redis:
+        image: redis
+        ports:
+          - 6379:6379
+      memcached:
+        image: memcached
+        ports:
+          - 11211:11211
+      dynamodb:
+        image: amazon/dynamodb-local:3.3.0
+        ports:
+          - 8000:8000
+    env:
+      MEMCACHED: localhost:11211
+      REDIS_URL: "redis://localhost:6379/0"
+    steps:
+      - name: Check out code into the Go module directory
+        uses: actions/checkout@v7
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        id: go
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: |
+            go.sum
+            deploy/cdk/go.sum
+
+      - name: Go Test
+        run: |
+          for i in {1..5}; do if ! echo stats | nc -w 1 localhost 11211 >/dev/null; then echo 'Waiting for memcached' && sleep 1; fi; done
+          go test ./cmd/... ./pkg/... -race -coverprofile=coverage.txt -covermode=atomic -v
+
+      - name: Go Test (CDK)
+        working-directory: deploy/cdk
+        env:
+          DYNAMODB_ENDPOINT: http://localhost:8000
+        run: |
+          for i in {1..30}; do
+          if nc -z -w 1 localhost 8000; then
+          go test . -race
+          exit $?
+          fi
+          echo 'Waiting for DynamoDB Local'
+          sleep 1
+          done
+          echo 'DynamoDB Local did not become ready' >&2
+          exit 1
+
+      - name: codecov upload
+        uses: codecov/codecov-action@v3
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+  rust-server:
+    name: Rust Server Test
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: server
+    services:
+      redis:
+        image: redis
+        ports:
+          - 6379:6379
+      valkey:
+        image: valkey/valkey
+        ports:
+          - 6380:6379
+      memcached:
+        image: memcached
+        ports:
+          - 11211:11211
+    env:
+      REDIS_URL: "redis://localhost:6379/0"
+      VALKEY_URL: "redis://localhost:6380/0"
+      MEMCACHED: localhost:11211
+      YOPASS_GO_SERVER: /tmp/yopass-go
+    steps:
+      - uses: actions/checkout@v7
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Build the Go server for the comparison tests
+        working-directory: .
+        run: go build -o /tmp/yopass-go ./cmd/yopass-server
+      - name: Set up Rust
+        # The pinned rust-toolchain.toml, so a new stable's clippy lints cannot fail unrelated PRs.
+        run: rustup toolchain install
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: server
+      - name: Check formatting
+        run: cargo fmt --check
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: Start a Redis Sentinel set
+        run: |
+          docker run -d --name sentinel --network host -v "$PWD/tests:/tests:ro" redis sleep infinity
+          out=$(docker exec sentinel /tests/sentinel.sh /data)
+          url=$(tail -n 1 <<< "$out")
+          ready=
+          for _ in $(seq 50); do
+          if docker exec sentinel redis-cli -p 16410 -a sentinel-pw --no-auth-warning \
+          sentinel get-master-addr-by-name mymaster | grep -q 16400; then
+          ready=1
+          break
+          fi
+          sleep 0.2
+          done
+          [ -n "$ready" ] || { echo "Sentinel did not report a primary"; exit 1; }
+          echo "SENTINEL_URL=$url" >> "$GITHUB_ENV"
+      - name: Start a TLS Redis with the test CA
+        run: |
+          docker exec sentinel redis-server --port 0 --tls-port 16420 --bind 127.0.0.1 \
+          --tls-cert-file /tests/fixtures/s3_cert.pem --tls-key-file /tests/fixtures/s3_key.pem \
+          --tls-ca-cert-file /tests/fixtures/s3_ca.pem --tls-auth-clients no --save '' --daemonize yes
+          ready=
+          for _ in $(seq 50); do
+          if [ "$(docker exec sentinel redis-cli --tls --cacert /tests/fixtures/s3_ca.pem -p 16420 ping)" = PONG ]; then
+          ready=1
+          break
+          fi
+          sleep 0.2
+          done
+          [ -n "$ready" ] || { echo "TLS Redis did not start"; exit 1; }
+          echo "REDIS_TLS_URL=rediss://127.0.0.1:16420/0" >> "$GITHUB_ENV"
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-llvm-cov
+      - name: Test with coverage
+        run: |
+          rustup component add llvm-tools
+          cargo llvm-cov --locked --lcov --output-path lcov.info --fail-under-lines 96
+      - name: codecov upload
+        uses: codecov/codecov-action@v3
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: server/lcov.info
+          flags: server
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-audit
+      - name: Audit dependencies
+        run: cargo audit
+  rust-changes:
+    name: Detect Rust changes
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: read
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+    steps:
+      - uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          filters: |
+            rust: ['cli/**', 'rust-toolchain.toml', 'install.sh', '.github/workflows/test.yml', 'cmd/yopass/**', 'pkg/**', 'go.mod', 'go.sum']
+  rust:
+    name: Rust CLI Test (${{ matrix.os }})
+    needs: rust-changes
+    if: needs.rust-changes.outputs.rust == 'true'
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    defaults:
+      run:
+        working-directory: cli
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      # Interop and lint results do not depend on the OS, so they run on Linux only.
+      - uses: actions/setup-node@v4
+        if: runner.os == 'Linux'
+        with:
+          node-version: 24
+          cache: "yarn"
+          cache-dependency-path: website/yarn.lock
+
+      - name: Install OpenPGP.js for interop tests
+        if: runner.os == 'Linux'
+        working-directory: website
+        run: |
+          yarn install --frozen-lockfile
+          echo "YOPASS_REQUIRE_OPENPGPJS=1" >> "$GITHUB_ENV"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: cli
+
+      - name: Format and lint
+        if: runner.os == 'Linux'
+        run: cargo fmt --check && cargo clippy --all-targets -- -D warnings
+
+      - name: Test
+        if: runner.os != 'Linux'
+        run: cargo test --locked
+
+      - uses: taiki-e/install-action@v2
+        if: runner.os == 'Linux'
+        with:
+          tool: cargo-llvm-cov
+
+      # What is left uncovered is Windows-only or unreachable, so keep the floor high.
+      - name: Test with coverage
+        if: runner.os == 'Linux'
+        run: |
+          rustup component add llvm-tools
+          cargo llvm-cov --locked --lcov --output-path lcov.info --fail-under-lines 97
+
+      - name: codecov upload
+        if: runner.os == 'Linux'
+        uses: codecov/codecov-action@v3
+        with:
+          token: ${{ secrets.CODECOV_TOKEN }}
+          files: cli/lcov.info
+          flags: cli
+
+  rust-platforms:
+    name: Rust CLI (windows-latest)
+    needs: rust-changes
+    if: needs.rust-changes.outputs.rust == 'true'
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: cli
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: cli
+
+      - name: Unit tests
+        run: cargo test --locked --bin yopass
+
+  node:
+    name: Website Test
+    needs: [website-checks, e2e]
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check website results
+        env:
+          CHECKS_RESULT: ${{ needs.website-checks.result }}
+          E2E_RESULT: ${{ needs.e2e.result }}
+        run: test "$CHECKS_RESULT" = success && test "$E2E_RESULT" = success
+
+  website-checks:
+    name: Website Checks
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: website
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: "yarn"
+          cache-dependency-path: website/yarn.lock
+
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+      - name: Lint
+        run: yarn tsc && yarn run lint
+
+      - name: Run unit tests
+        run: yarn test:unit
+
+  e2e:
+    name: Website E2E (${{ matrix.browser }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        browser: [chromium, firefox, webkit]
+    defaults:
+      run:
+        working-directory: website
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: "yarn"
+          cache-dependency-path: website/yarn.lock
+
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+
+      - name: Install Playwright Browsers
+        run: yarn playwright install --with-deps ${{ matrix.browser }}
+
+      - name: Run Playwright tests
+        run: yarn test:e2e --project=${{ matrix.browser }}
+        env:
+          CI: true
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: playwright-report-${{ matrix.browser }}
+          path: website/playwright-report/
+          retention-days: 30
+
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: test-results-${{ matrix.browser }}
+          path: website/test-results/
+          retention-days: 30
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+  dependabot-merge:
+    name: "Dependabot automerge"
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: write
+    needs: ["node", "go", "rust-server", "rust-changes", "rust", "rust-platforms"]
+    # always() so skipped Rust jobs do not skip this; failures still block it.
+    if: >-
+      always() && github.actor == 'dependabot[bot]' && github.event_name == 'pull_request'
+      && !contains(needs.*.result, 'failure') && !contains(needs.*.result, 'cancelled')
+    steps:
+      - uses: fastify/github-action-merge-dependabot@v3
+        with:
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          target: "minor"
+          # Pre-1.0 "minor" bumps can break, and these handle secrets or their settings.
+          exclude: "rand,serde_yaml_ng,rust-toolchain"

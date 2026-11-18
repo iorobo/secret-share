@@ -1,0 +1,59 @@
+services:
+  memcached:
+    image: memcached:1.6.39-alpine
+    restart: unless-stopped
+    mem_limit: ${MEMCACHED_CONTAINER_MEMORY:-128m}
+    command:
+      - -m
+      - ${MEMCACHED_MEMORY_MB:-64}
+      - -I
+      - 2m
+      - -M
+      - -U
+      - "0"
+    expose:
+      - "11211"
+    networks:
+      - storage
+    healthcheck:
+      test: ["CMD-SHELL", "printf 'version\\r\\n' | nc -w 2 127.0.0.1 11211 | grep -q '^VERSION '"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  secret-share:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    expose:
+      - "1337"
+    environment:
+      DATABASE: memcached
+      MEMCACHED: memcached:11211
+      PORT: "1337"
+      PUBLIC_URL: ${PUBLIC_URL:-https://secret.bode.one}
+      DEFAULT_EXPIRY: 3h
+      FORCE_ONETIME_SECRETS: "true"
+      DISABLE_FEATURES: "true"
+      LICENSE_KEY: ${LICENSE_KEY:-}
+      DISABLE_READ_RECEIPTS: "false"
+      DEFAULT_READ_RECEIPT: "true"
+    networks:
+      - default
+      - storage
+    depends_on:
+      memcached:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "/secret-share-server", "--health-check"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 5s
+
+networks:
+  default:
+  storage:
+    internal: true

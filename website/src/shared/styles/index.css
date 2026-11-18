@@ -1,0 +1,270 @@
+@import 'tailwindcss';
+@import '@fontsource/ibm-plex-mono/400.css';
+@import '@fontsource/ibm-plex-mono/500.css';
+@plugin "daisyui" {
+  themes: all;
+}
+
+@theme {
+  --font-mono:
+    'IBM Plex Mono', ui-monospace, 'SFMono-Regular', Menlo, Consolas, monospace;
+}
+
+@layer base {
+  h1,
+  h2,
+  h3 {
+    letter-spacing: 0;
+  }
+}
+
+:root[data-theme='emerald'] {
+  --color-primary: #002b3e;
+  --color-primary-content: #ffffff;
+  --color-secondary: #002b3e;
+  --color-secondary-content: #ffffff;
+  --color-base-100: #ffffff;
+  --color-base-200: #f3f6f6;
+  --color-base-300: #d7e1e3;
+  --color-base-content: #15333d;
+  --color-success: #277555;
+  --color-success-content: #ffffff;
+  --color-warning: #f3dfaa;
+  --color-warning-content: #4a3913;
+}
+
+:root {
+  --radius-box: 0.5rem;
+  --radius-field: 0;
+  --radius-selector: 0;
+}
+
+:root[data-theme='dim'] {
+  color-scheme: dark;
+  --color-primary: #86c7c1;
+  --color-primary-content: #002b3e;
+  --color-secondary: #b6dadd;
+  --color-secondary-content: #002b3e;
+  --color-base-100: #0c2028;
+  --color-base-200: #102b35;
+  --color-base-300: #31505b;
+  --color-base-content: #edf5f5;
+  --color-neutral: #193b47;
+  --color-neutral-content: #edf5f5;
+  --color-accent: #6ab3ac;
+  --color-accent-content: #002b3e;
+  --color-success: #89c9a7;
+  --color-success-content: #0c2028;
+  --color-warning: #3b3523;
+  --color-warning-content: #f3dfaa;
+  --color-info: #b6dadd;
+  --color-info-content: #002b3e;
+}
+
+.btn {
+  border-radius: 0;
+}
+
+.btn-primary:not(.btn-disabled):not(:disabled):hover {
+  --btn-bg: #124454;
+  --btn-border: #124454;
+  --btn-fg: #ffffff;
+}
+
+:root[data-theme='dim'] .btn-primary:not(.btn-disabled):not(:disabled):hover {
+  --btn-bg: #b6dadd;
+  --btn-border: #b6dadd;
+  --btn-fg: #002b3e;
+}
+
+.bode-app {
+  background-image: linear-gradient(
+    180deg,
+    color-mix(in srgb, var(--color-base-200) 65%, transparent),
+    transparent 340px
+  );
+}
+
+.bode-header {
+  background: #002b3e;
+  color: #ffffff;
+  border-bottom: 3px solid #6ab3ac;
+}
+
+.bode-header a,
+.bode-header button {
+  color: #ffffff;
+}
+
+.bode-header a:hover,
+.bode-header button:hover {
+  background: #124454;
+}
+
+.bode-header .bode-nav-link[aria-current='page'] {
+  background: #124454;
+  color: #ffffff;
+  box-shadow: inset 0 -2px #86c7c1;
+}
+
+.bode-header .dropdown-content {
+  color: var(--color-base-content);
+}
+
+.bode-header .dropdown-content button,
+.bode-header .dropdown-content a {
+  color: inherit;
+}
+
+.bode-header .dropdown-content button:hover,
+.bode-header .dropdown-content a:hover {
+  background: var(--color-base-200);
+}
+
+.bode-workspace {
+  min-width: 0;
+  animation: result-enter 300ms ease-out both;
+}
+
+.bode-workspace h2 {
+  font-size: 1.625rem;
+  margin-bottom: 1.75rem;
+}
+
+.bode-workspace .bode-result-title {
+  margin: 0;
+}
+
+.bode-workspace textarea {
+  min-height: 190px;
+}
+
+.bode-workspace .btn-primary {
+  box-shadow: none;
+}
+
+.bode-footer {
+  background: var(--color-base-200);
+}
+
+.tracking-tight {
+  letter-spacing: 0;
+}
+
+@media (max-width: 380px) {
+  .bode-brand {
+    font-size: 1rem;
+    gap: 0.375rem;
+  }
+  .bode-brand img {
+    width: 34px;
+    height: 34px;
+  }
+}
+
+@keyframes result-enter {
+  from {
+    opacity: 0;
+    transform: translateY(8px);
+  }
+}
+
+@keyframes result-icon {
+  0% {
+    opacity: 0;
+    transform: scale(0.6);
+  }
+  60% {
+    transform: scale(1.08);
+  }
+  100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+}
+
+@keyframes alert-enter {
+  from {
+    opacity: 0;
+    transform: translateY(-4px);
+  }
+}
+
+@keyframes copy-confirm {
+  0% {
+    transform: scale(1);
+  }
+  40% {
+    transform: scale(1.08);
+  }
+  100% {
+    transform: scale(1);
+  }
+}
+
+.animate-result-enter {
+  animation: result-enter 350ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.animate-result-icon {
+  animation: result-icon 450ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.animate-alert-enter {
+  animation: alert-enter 200ms cubic-bezier(0.16, 1, 0.3, 1) both;
+}
+
+.animate-copy-confirm {
+  animation: copy-confirm 250ms cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+@keyframes decrypt-error {
+  0%,
+  100% {
+    transform: translateX(0);
+  }
+  20%,
+  60% {
+    transform: translateX(-3px);
+  }
+  40%,
+  80% {
+    transform: translateX(3px);
+  }
+}
+
+.animate-decrypt-error {
+  animation: decrypt-error 250ms ease-out;
+}
+
+@keyframes status-ring {
+  from {
+    opacity: 0.7;
+    transform: scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: scale(2);
+  }
+}
+
+.animate-status-ring {
+  animation: status-ring 1.2s cubic-bezier(0.16, 1, 0.3, 1) 250ms 2;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-status-ring,
+  .animate-result-enter,
+  .animate-result-icon,
+  .animate-alert-enter,
+  .animate-copy-confirm,
+  .animate-decrypt-error {
+    animation: none;
+  }
+}
+
+/* User content stays LTR in every language; only an empty field's placeholder,
+   which is page text, follows the page. */
+[dir='rtl'] .content-input:placeholder-shown {
+  direction: rtl;
+}

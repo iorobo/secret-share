@@ -1,0 +1,835 @@
+import { test, expect, Page } from '@playwright/test';
+import { MockAPI } from './helpers/mock-api';
+
+interface StoredRequest {
+  public_key: string;
+  label: string;
+  note?: string;
+  state: 'pending' | 'fulfilled';
+  secret?: string;
+  kind?: 'text' | 'file';
+  expires_at: number;
+  token: string;
+}
+
+// Stateful mock of the /request backend. All cryptography (key generation,
+// encryption, decryption) still runs for real in the browser.
+async function mockRequestAPI(page: Page, store: Map<string, StoredRequest>) {
+  let counter = 0;
+  const headers = { 'content-type': 'application/json' };
+
+  await page.route('**/request', async route => {
+    const body = JSON.parse(route.request().postData() || '{}');
+    counter += 1;
+    const id = `e2eRequestId00000000${counter}`.slice(-22);
+    const token = `e2e-token-${counter}`;
+    const expires_at = Math.floor(Date.now() / 1000) + body.expiration;
+    store.set(id, {
+      public_key: body.public_key,
+      label: body.label || '',
+      note: body.note,
+      state: 'pending',
+      expires_at,
+      token,
+    });
+    await route.fulfill({
+      status: 200,
+      headers,
+      json: { id, token, expires_at },
+    });
+  });
+
+  await page.route('**/request/**', async route => {
+    const url = new URL(route.request().url());
+    const parts = url.pathname.split('/').filter(Boolean);
+    const id = parts[1];
+    const sub = parts[2];
+    const method = route.request().method();
+    const request = store.get(id);
+
+    if (!request) {
+      await route.fulfill({
+        status: 404,
+        headers,
+        json: { message: 'Secret request not found' },
+      });
+      return;
+    }
+
+    const token = route.request().headers()['x-yopass-request-token'];
+
+    if (!sub && method === 'GET') {
+      await route.fulfill({
+        status: 200,
+        headers,
+        json: {
+          public_key: request.public_key,
+          label: request.label,
+          note: request.note,
+          state: request.state,
+          expires_at: request.expires_at,
+        },
+      });
+      return;
+    }
+
+    if (!sub && method === 'DELETE') {
+      if (token !== request.token) {
+        await route.fulfill({
+          status: 401,
+          headers,
+          json: { message: 'Invalid request token' },
+        });
+        return;
+      }
+      store.delete(id);
+      await route.fulfill({ status: 204, headers, body: '' });
+      return;
+    }
+
+    if (sub === 'secret' && method === 'POST') {
+      const body = JSON.parse(route.request().postData() || '{}');
+      request.state = 'fulfilled';
+      request.secret = body.message;
+      request.kind = body.kind || 'text';
+      await route.fulfill({
+        status: 200,
+        headers,
+        json: { message: 'secret provided' },
+      });
+      return;
+    }
+
+    if (sub === 'secret' && method === 'GET') {
+      if (token !== request.token) {
+        await route.fulfill({
+          status: 401,
+          headers,
+          json: { message: 'Invalid request token' },
+        });
+        return;
+      }
+      const { secret, kind } = request;
+      store.delete(id);
+      await route.fulfill({
+        status: 200,
+        headers,
+        json: { message: secret, kind: kind || 'text' },
+      });
+      return;
+    }
+
+    if (sub === 'key' && method === 'PUT') {
+      if (token !== request.token) {
+        await route.fulfill({
+          status: 401,
+          headers,
+          json: { message: 'Invalid request token' },
+        });
+        return;
+      }
+      const body = JSON.parse(route.request().postData() || '{}');
+      request.public_key = body.public_key;
+      await route.fulfill({
+        status: 200,
+        headers,
+        json: { message: 'public key updated' },
+      });
+      return;
+    }
+
+    await route.fulfill({
+      status: 404,
+      headers,
+      json: { message: 'not found' },
+    });
+  });
+}
+
+test.describe('Secret Requests', () => {
+  let mockAPI: MockAPI;
+  let store: Map<string, StoredRequest>;
+
+  test.beforeEach(async ({ page }) => {
+    mockAPI = new MockAPI(page);
+    store = new Map();
+    await mockAPI.mockConfigEndpoint({ SECRET_REQUESTS: true });
+    await mockRequestAPI(page, store);
+  });
+
+  test.afterEach(async () => {
+    await mockAPI.clearAllMocks();
+  });
+
+  for (const { value, label } of [
+    { value: 3600, label: 'one hour' },
+    { value: 86400, label: 'one day' },
+    { value: 604800, label: 'one week' },
+  ]) {
+    test(`request uses forced expiration of ${label}`, async ({ page }) => {
+      await mockAPI.mockConfigEndpoint({
+        SECRET_REQUESTS: true,
+        FORCE_EXPIRATION: value,
+        DEFAULT_EXPIRY: value === 3600 ? 86400 : 3600,
+      });
+      await page.goto('/#/request');
+      await expect(page.getByRole('radio')).toHaveCount(0);
+      await expect(
+        page.getByText(`Secret will expire in ${label}`, { exact: true }),
+      ).toBeVisible();
+      const submitted = page.waitForRequest(
+        request =>
+          request.method() === 'POST' &&
+          new URL(request.url()).pathname === '/request',
+      );
+      await page.getByRole('button', { name: 'Create request link' }).click();
+      expect((await submitted).postDataJSON().expiration).toBe(value);
+      await expect(
+        page.getByRole('heading', { name: 'Request created' }),
+      ).toBeVisible();
+    });
+  }
+
+  test('request allows choosing expiration when no value is forced', async ({
+    page,
+  }) => {
+    await mockAPI.mockConfigEndpoint({
+      SECRET_REQUESTS: true,
+      DEFAULT_EXPIRY: 86400,
+    });
+    await page.goto('/#/request');
+    await expect(page.getByRole('radio')).toHaveCount(3);
+    await expect(
+      page.getByRole('radio', { name: 'One Day', exact: true }),
+    ).toBeChecked();
+    await page.getByRole('radio', { name: 'One Week', exact: true }).check();
+    const submitted = page.waitForRequest(
+      request =>
+        request.method() === 'POST' &&
+        new URL(request.url()).pathname === '/request',
+    );
+    await page.getByRole('button', { name: 'Create request link' }).click();
+    expect((await submitted).postDataJSON().expiration).toBe(604800);
+    await expect(
+      page.getByRole('heading', { name: 'Request created' }),
+    ).toBeVisible();
+  });
+
+  test('malformed creation success does not persist a request or show a broken link', async ({
+    page,
+  }) => {
+    await page.route('**/request', route =>
+      route.fulfill({ status: 200, json: {} }),
+    );
+    await page.goto('/#/request');
+    await page.getByRole('button', { name: 'Create request link' }).click();
+    await expect(
+      page.getByText('HTTP 200: unexpected response body'),
+    ).toBeVisible();
+    await expect(
+      page.getByRole('heading', { name: 'Request created' }),
+    ).toHaveCount(0);
+    expect(
+      await page.evaluate(() => localStorage.getItem('yopass-secret-requests')),
+    ).toBeNull();
+    await expect(
+      page.getByRole('button', { name: 'Create request link' }),
+    ).toBeEnabled();
+  });
+
+  test('full flow: create request, provide secret, view decrypted secret', async ({
+    page,
+  }) => {
+    // Requester creates a request (generates a real key pair in the browser)
+    await page.goto('/#/request');
+    // The label field warns that labels are stored unencrypted
+    await expect(
+      page.locator('text=The label is stored unencrypted'),
+    ).toBeVisible();
+    await page.fill('#request-label', 'Staging DB password');
+    await page.click('button:has-text("Create request link")');
+
+    await expect(page.locator('h2:has-text("Request created")')).toBeVisible({
+      timeout: 15000,
+    });
+    const link = await page.locator('code').textContent();
+    expect(link).toContain('/#/r/');
+
+    // Responder opens the link and submits a secret (encrypted in browser)
+    await page.goto(link!);
+    await expect(
+      page.locator('h2:has-text("Someone requested a secret")'),
+    ).toBeVisible();
+    await expect(page.locator('text=Staging DB password')).toBeVisible();
+    await page.fill('#provide-secret', 'hunter2-super-secret');
+    await page.click('button:has-text("Encrypt and send")');
+    await expect(page.locator('h2:has-text("Secret sent")')).toBeVisible({
+      timeout: 15000,
+    });
+
+    // The ciphertext stored on the "server" must be PGP encrypted
+    const stored = [...store.values()][0];
+    expect(stored.state).toBe('fulfilled');
+    expect(stored.secret).toContain('-----BEGIN PGP MESSAGE-----');
+    expect(stored.secret).not.toContain('hunter2-super-secret');
+
+    // Requester sees the fulfilled state and decrypts the secret locally
+    await page.goto('/#/requests');
+    await expect(page.locator('text=Secret provided')).toBeVisible();
+    await page.click('button:has-text("View secret")');
+    await expect(
+      page.locator('h3:has-text("View the secret now?")'),
+    ).toBeVisible();
+    await page.click('button:has-text("View now")');
+    await expect(page.locator('h3:has-text("Secret received")')).toBeVisible({
+      timeout: 15000,
+    });
+    await expect(page.locator('pre')).toHaveText('hunter2-super-secret');
+
+    // The request was deleted from the server and is marked as collected
+    expect(store.size).toBe(0);
+    await page.click('button:has-text("Close")');
+    await expect(page.locator('.badge:has-text("Collected")')).toBeVisible();
+  });
+
+  test('opening a link again after providing shows it was already provided', async ({
+    page,
+  }) => {
+    await page.goto('/#/request');
+    await page.click('button:has-text("Create request link")');
+    const link = await page.locator('code').textContent({ timeout: 15000 });
+    await page.goto(link!);
+    await page.fill('#provide-secret', 'first answer');
+    await page.click('button:has-text("Encrypt and send")');
+    await expect(page.locator('h2:has-text("Secret sent")')).toBeVisible({
+      timeout: 15000,
+    });
+
+    await page.reload();
+    await expect(
+      page.locator('h2:has-text("Secret already provided")'),
+    ).toBeVisible();
+    await expect(page.locator('#provide-secret')).toHaveCount(0);
+  });
+
+  test('note is shown to the responder', async ({ page }) => {
+    await mockAPI.mockConfigEndpoint({
+      SECRET_REQUESTS: true,
+      MAX_REQUEST_NOTE_LENGTH: 20,
+    });
+    await page.goto('/#/request');
+    await expect(
+      page.getByText('Not encrypted: anyone with the request link'),
+    ).toBeVisible();
+    // The limit counts characters (code points) like the server. Going over
+    // keeps the text, marks the field invalid and blocks submit.
+    const submit = page.locator('button:has-text("Create request link")');
+    await page.fill('#request-note', '😀'.repeat(20));
+    await expect(page.getByTestId('request-note-count')).toHaveText('20/20');
+    await expect(submit).toBeEnabled();
+    await page.fill('#request-note', 'a'.repeat(21));
+    await expect(page.getByTestId('request-note-count')).toHaveText('21/20');
+    await expect(page.locator('#request-note')).toHaveAttribute(
+      'aria-invalid',
+      'true',
+    );
+    await expect(submit).toBeDisabled();
+    // Surrounding whitespace doesn't count and no input is ever cut off.
+    const padded = ' '.repeat(35) + 'use key B';
+    await page.fill('#request-note', padded);
+    await expect(page.locator('#request-note')).toHaveValue(padded);
+    await expect(page.getByTestId('request-note-count')).toHaveText('9/20');
+    await expect(submit).toBeEnabled();
+    await page.fill('#request-note', 'Read-only creds');
+    await expect(page.getByText('15/20')).toBeVisible();
+    await page.click('button:has-text("Create request link")');
+    await expect(page.locator('h2:has-text("Request created")')).toBeVisible({
+      timeout: 15000,
+    });
+    expect([...store.values()][0].note).toBe('Read-only creds');
+
+    await page.goto((await page.locator('code').textContent())!);
+    await expect(page.getByText('Note from the requester')).toBeVisible();
+    await expect(page.getByText('Read-only creds')).toBeVisible();
+  });
+
+  test('note field is hidden when notes are disabled', async ({ page }) => {
+    await page.goto('/#/request');
+    await expect(page.locator('#request-label')).toBeVisible();
+    await expect(page.locator('#request-note')).toHaveCount(0);
+  });
+
+  test('full flow with a file response: upload, decrypt, download', async ({
+    page,
+  }) => {
+    const fileContent = 'file-secret-content-🔑\nsecond line';
+
+    // Requester creates a request
+    await page.goto('/#/request');
+    await page.fill('#request-label', 'TLS certificate');
+    await page.click('button:has-text("Create request link")');
+    await expect(page.locator('h2:has-text("Request created")')).toBeVisible({
+      timeout: 15000,
+    });
+    const link = await page.locator('code').textContent();
+
+    // Responder opens the link, switches to the file tab and uploads a file
+    await page.goto(link!);
+    await expect(
+      page.locator('h2:has-text("Someone requested a secret")'),
+    ).toBeVisible();
+    await page.click('[role="tab"]:has-text("File")');
+    await page.setInputFiles('#provide-file-input', {
+      name: 'server.pem',
+      mimeType: 'application/x-pem-file',
+      buffer: Buffer.from(fileContent),
+    });
+    await expect(page.locator('text=server.pem')).toBeVisible();
+    await page.click('button:has-text("Encrypt and send")');
+    await expect(page.locator('h2:has-text("Secret sent")')).toBeVisible({
+      timeout: 15000,
+    });
+
+    // The stored ciphertext is PGP encrypted and marked as a file; the
+    // filename travels inside the ciphertext, not in server-visible metadata
+    const stored = [...store.values()][0];
+    expect(stored.state).toBe('fulfilled');
+    expect(stored.kind).toBe('file');
+    expect(stored.secret).toContain('-----BEGIN PGP MESSAGE-----');
+    expect(stored.secret).not.toContain('file-secret-content');
+    expect(stored.secret).not.toContain('server.pem');
+
+    // Requester decrypts locally and downloads the file
+    await page.goto('/#/requests');
+    await expect(page.locator('text=Secret provided')).toBeVisible();
+    await page.click('button:has-text("View secret")');
+    await expect(
+      page.locator('h3:has-text("View the secret now?")'),
+    ).toBeVisible();
+    await page.click('button:has-text("View now")');
+    await expect(page.locator('h3:has-text("Secret received")')).toBeVisible({
+      timeout: 15000,
+    });
+    await expect(
+      page.locator('.modal-box:has-text("server.pem")'),
+    ).toBeVisible();
+
+    const downloadPromise = page.waitForEvent('download');
+    await page.click('button:has-text("Download file")');
+    const download = await downloadPromise;
+    expect(download.suggestedFilename()).toBe('server.pem');
+    const downloadPath = test.info().outputPath('downloaded-server.pem');
+    await download.saveAs(downloadPath);
+    const fs = await import('fs');
+    expect(fs.readFileSync(downloadPath, 'utf8')).toBe(fileContent);
+
+    // Consumed on retrieval, same as text secrets
+    expect(store.size).toBe(0);
+    await page.click('button:has-text("Close")');
+    await expect(page.locator('.badge:has-text("Collected")')).toBeVisible();
+  });
+
+  test('a file too large for the configured limit is rejected locally', async ({
+    page,
+  }) => {
+    await mockAPI.mockConfigEndpoint({
+      SECRET_REQUESTS: true,
+      MAX_REQUEST_FILE_SIZE: '1KB',
+    });
+    await page.goto('/#/request');
+    await page.click('button:has-text("Create request link")');
+    await expect(page.locator('h2:has-text("Request created")')).toBeVisible({
+      timeout: 15000,
+    });
+    const link = await page.locator('code').textContent();
+
+    await page.goto(link!);
+    await page.click('[role="tab"]:has-text("File")');
+    await page.setInputFiles('#provide-file-input', {
+      name: 'too-big.bin',
+      mimeType: 'application/octet-stream',
+      buffer: Buffer.alloc(2048, 1),
+    });
+    await expect(
+      page.locator('text=File exceeds the maximum allowed size'),
+    ).toBeVisible();
+    await expect(
+      page.locator('button:has-text("Encrypt and send")'),
+    ).toBeDisabled();
+  });
+
+  test('file tab is hidden when uploads are disabled', async ({ page }) => {
+    await mockAPI.mockConfigEndpoint({
+      SECRET_REQUESTS: true,
+      DISABLE_UPLOAD: true,
+    });
+    await page.goto('/#/request');
+    await page.click('button:has-text("Create request link")');
+    await expect(page.locator('h2:has-text("Request created")')).toBeVisible({
+      timeout: 15000,
+    });
+    const link = await page.locator('code').textContent();
+
+    await page.goto(link!);
+    await expect(
+      page.locator('h2:has-text("Someone requested a secret")'),
+    ).toBeVisible();
+    await expect(page.locator('[role="tab"]')).toHaveCount(0);
+    await expect(page.locator('#provide-secret')).toBeVisible();
+  });
+
+  test('pending request can be revoked from the list', async ({ page }) => {
+    await page.goto('/#/request');
+    await page.click('button:has-text("Create request link")');
+    await expect(page.locator('h2:has-text("Request created")')).toBeVisible({
+      timeout: 15000,
+    });
+
+    await page.goto('/#/requests');
+    await expect(page.locator('text=Awaiting secret')).toBeVisible();
+
+    await page.click('button[aria-label="More actions"]');
+    await page.click('button:has-text("Revoke")');
+    await expect(
+      page.locator('h3:has-text("Revoke this request?")'),
+    ).toBeVisible();
+    await page.click('button:has-text("Revoke request")');
+
+    await expect(page.locator('.badge:has-text("Revoked")')).toBeVisible();
+    expect(store.size).toBe(0);
+  });
+
+  test('responder page has a minimal English-only header', async ({ page }) => {
+    await mockAPI.mockConfigEndpoint({
+      SECRET_REQUESTS: true,
+      READ_RECEIPTS: true,
+      OIDC_ENABLED: true,
+    });
+    // Logged out, so the Login link shows outside the responder page.
+    await page.route('**/auth/me', route => route.fulfill({ status: 401 }));
+    await page.goto('/#/request');
+    await expect(
+      page.getByText('Share secrets securely with ease'),
+    ).toBeVisible();
+    // Present elsewhere, so the absence checks below are meaningful.
+    for (const href of ['#/requests', '#/upload', '#/receipts']) {
+      await expect(page.locator(`header a[href="${href}"]`)).toBeVisible();
+    }
+    await expect(page.locator('header a[href$="/auth/login"]')).toBeVisible();
+    await page.click('button:has-text("Create request link")');
+    await expect(page.locator('h2:has-text("Request created")')).toBeVisible({
+      timeout: 15000,
+    });
+
+    await page.goto((await page.locator('code').textContent())!);
+    await expect(
+      page.locator('h2:has-text("Someone requested a secret")'),
+    ).toBeVisible();
+    const header = page.locator('header');
+    await expect(header.locator('a[href="/"]')).toBeVisible();
+    await expect(
+      header.getByRole('button', { name: 'Settings' }),
+    ).toBeVisible();
+    await expect(header.locator('a[href="#/requests"]')).toHaveCount(0);
+    await expect(header.locator('a[href="#/upload"]')).toHaveCount(0);
+    await expect(header.locator('a[href="#/receipts"]')).toHaveCount(0);
+    await expect(header.locator('a[href$="/auth/login"]')).toHaveCount(0);
+    await expect(
+      page.getByText('Share secrets securely with ease'),
+    ).toHaveCount(0);
+
+    await header.getByRole('button', { name: 'Settings' }).click();
+    await expect(page.locator('#settings-language')).toHaveCount(0);
+    await expect(page.locator('[data-testid="theme-toggle"]')).toBeVisible();
+    await expect(
+      page.locator('h2:has-text("Someone requested a secret")'),
+    ).toBeVisible();
+  });
+
+  test('opening a revoked or expired link shows an error', async ({ page }) => {
+    await page.goto('/#/r/doesNotExist12345678ab/abcdef0123456789');
+    await expect(
+      page.locator('h2:has-text("Request not available")'),
+    ).toBeVisible();
+  });
+
+  test('tampered public key fails the fingerprint verification', async ({
+    page,
+  }) => {
+    await page.goto('/#/request');
+    await page.click('button:has-text("Create request link")');
+    await expect(page.locator('h2:has-text("Request created")')).toBeVisible({
+      timeout: 15000,
+    });
+    const link = await page.locator('code').textContent();
+
+    // Simulate a malicious server swapping the public key after creation:
+    // point the stored request at a different (freshly generated) key by
+    // changing the fingerprint segment of the link instead.
+    const tamperedLink = link!.replace(/\/[0-9a-f]{16}$/, '/0123456789abcdef');
+    await page.goto(tamperedLink);
+    await expect(
+      page.locator('h2:has-text("Key verification failed")'),
+    ).toBeVisible();
+  });
+
+  test('a link without a fingerprint refuses to render the form', async ({
+    page,
+  }) => {
+    await page.goto('/#/request');
+    await page.click('button:has-text("Create request link")');
+    await expect(page.locator('h2:has-text("Request created")')).toBeVisible({
+      timeout: 15000,
+    });
+    const link = await page.locator('code').textContent();
+
+    // A link truncated at the last slash has nothing to verify the server's
+    // public key against, so the form must not be offered.
+    await page.goto(link!.replace(/\/[0-9a-f]{16}$/, ''));
+    await expect(
+      page.locator('h2:has-text("Key verification failed")'),
+    ).toBeVisible();
+  });
+
+  test('requests navbar entry is hidden when feature is disabled', async ({
+    page,
+  }) => {
+    await mockAPI.mockConfigEndpoint({ SECRET_REQUESTS: false });
+    await page.goto('/');
+    await page.waitForLoadState('networkidle');
+    await expect(page.locator('a[href="#/requests"]')).not.toBeVisible();
+  });
+
+  test('the sign-in notice stays on the home page', async ({ page }) => {
+    await mockAPI.mockConfigEndpoint({
+      SECRET_REQUESTS: false,
+      SECRET_REQUESTS_DRAINING: true,
+    });
+    await page.goto('/?login_error=license_expired');
+    await expect(page.getByRole('alert')).toContainText('Sign-in');
+    await page.locator('a[href="#/requests"]').click();
+    await expect(page.getByRole('alert')).toHaveCount(1);
+    await expect(page.getByRole('alert')).toContainText('New secret requests');
+  });
+
+  test('an expired license warns on the list and blocks new requests', async ({
+    page,
+  }) => {
+    await mockAPI.mockConfigEndpoint({
+      SECRET_REQUESTS: false,
+      SECRET_REQUESTS_DRAINING: true,
+    });
+    for (const route of ['/#/requests', '/#/request']) {
+      await page.goto(route);
+      await expect(page.getByRole('alert')).toContainText(
+        'server license has expired',
+      );
+      await expect(page.getByRole('link', { name: 'New request' })).toHaveCount(
+        0,
+      );
+      await expect(page.locator('#request-label')).toHaveCount(0);
+    }
+  });
+
+  test('navbar badge counts fulfilled requests and clears after collection', async ({
+    page,
+  }) => {
+    // Create and fulfill a request
+    await page.goto('/#/request');
+    await page.click('button:has-text("Create request link")');
+    await expect(page.locator('h2:has-text("Request created")')).toBeVisible({
+      timeout: 15000,
+    });
+    const link = await page.locator('code').textContent();
+
+    // No secret provided yet — no badge
+    await page.goto('/');
+    await expect(
+      page.locator('[data-testid="requests-badge"]'),
+    ).not.toBeVisible();
+
+    await page.goto(link!);
+    await page.fill('#provide-secret', 'badge-test-secret');
+    await page.click('button:has-text("Encrypt and send")');
+    await expect(page.locator('h2:has-text("Secret sent")')).toBeVisible({
+      timeout: 15000,
+    });
+
+    // Badge shows one waiting secret
+    await page.goto('/');
+    await expect(page.locator('[data-testid="requests-badge"]')).toHaveText(
+      '1',
+    );
+
+    // Collecting the secret clears the badge
+    await page.goto('/#/requests');
+    await page.click('button:has-text("View secret")');
+    await expect(
+      page.locator('h3:has-text("View the secret now?")'),
+    ).toBeVisible();
+    await page.click('button:has-text("View now")');
+    await expect(page.locator('h3:has-text("Secret received")')).toBeVisible({
+      timeout: 15000,
+    });
+    await page.click('button:has-text("Close")');
+    await expect(
+      page.locator('[data-testid="requests-badge"]'),
+    ).not.toBeVisible();
+  });
+
+  test('collected requests can be cleared from the list', async ({ page }) => {
+    // Create, fulfill, and collect a request
+    await page.goto('/#/request');
+    await page.click('button:has-text("Create request link")');
+    await expect(page.locator('h2:has-text("Request created")')).toBeVisible({
+      timeout: 15000,
+    });
+    const link = await page.locator('code').textContent();
+    await page.goto(link!);
+    await page.fill('#provide-secret', 'clear-me');
+    await page.click('button:has-text("Encrypt and send")');
+    await expect(page.locator('h2:has-text("Secret sent")')).toBeVisible({
+      timeout: 15000,
+    });
+    await page.goto('/#/requests');
+    await page.click('button:has-text("View secret")');
+    await expect(
+      page.locator('h3:has-text("View the secret now?")'),
+    ).toBeVisible();
+    await page.click('button:has-text("View now")');
+    await expect(page.locator('h3:has-text("Secret received")')).toBeVisible({
+      timeout: 15000,
+    });
+    await page.click('button:has-text("Close")');
+    await expect(page.locator('.badge:has-text("Collected")')).toBeVisible();
+
+    // Clear collected entries
+    await page.click('button:has-text("Clear collected (1)")');
+    await expect(
+      page.locator('h3:has-text("Clear collected requests?")'),
+    ).toBeVisible();
+    await page.click('.modal button:has-text("Clear collected")');
+    await expect(page.locator('text=No secret requests yet')).toBeVisible();
+  });
+
+  test('exported request can be imported from a file', async ({ page }) => {
+    // Create a request and export it to a file
+    await page.goto('/#/request');
+    await page.fill('#request-label', 'Imported via file');
+    await page.click('button:has-text("Create request link")');
+    await expect(page.locator('h2:has-text("Request created")')).toBeVisible({
+      timeout: 15000,
+    });
+
+    await page.goto('/#/requests');
+    await page.click('button[aria-label="More actions"]');
+    const downloadPromise = page.waitForEvent('download');
+    await page.click('button:has-text("Export")');
+    const download = await downloadPromise;
+    const exportPath = test.info().outputPath('request-export.json');
+    await download.saveAs(exportPath);
+
+    // Simulate another browser by wiping the local store
+    await page.evaluate(() => localStorage.clear());
+    await page.reload();
+    await expect(page.locator('text=No secret requests yet')).toBeVisible();
+
+    // Import the exported file through the file picker
+    await page.click('button:has-text("Import")');
+    await page.setInputFiles('#request-import-file-input', exportPath);
+    await expect(page.locator('text=Imported via file')).toBeVisible();
+    await expect(
+      page.locator('.badge:has-text("Awaiting secret")'),
+    ).toBeVisible();
+  });
+
+  test('exported request can be imported by drag and drop', async ({
+    page,
+  }) => {
+    await page.goto('/#/request');
+    await page.fill('#request-label', 'Imported via drop');
+    await page.click('button:has-text("Create request link")');
+    await expect(page.locator('h2:has-text("Request created")')).toBeVisible({
+      timeout: 15000,
+    });
+
+    // Build the export payload from the stored request, then wipe the store
+    await page.goto('/#/requests');
+    const exported = await page.evaluate(() => {
+      const requests = JSON.parse(
+        localStorage.getItem('yopass-secret-requests') || '[]',
+      );
+      return JSON.stringify({ yopassSecretRequest: 1, ...requests[0] });
+    });
+    await page.evaluate(() => localStorage.clear());
+    await page.reload();
+    await expect(page.locator('text=No secret requests yet')).toBeVisible();
+
+    // Drop the export as a file onto the import dropzone
+    await page.click('button:has-text("Import")');
+    await page.evaluate(json => {
+      const dataTransfer = new DataTransfer();
+      dataTransfer.items.add(
+        new File([json], 'yopass-request.json', { type: 'application/json' }),
+      );
+      const dropzone = document.querySelector(
+        '[data-testid="import-dropzone"]',
+      )!;
+      dropzone.dispatchEvent(
+        new DragEvent('drop', { dataTransfer, bubbles: true }),
+      );
+    }, exported);
+    await expect(page.locator('text=Imported via drop')).toBeVisible();
+    await expect(
+      page.locator('.badge:has-text("Awaiting secret")'),
+    ).toBeVisible();
+  });
+
+  test('importing an invalid file shows an error', async ({ page }) => {
+    await page.goto('/#/requests');
+    await page.click('button:has-text("Import")');
+    await page.setInputFiles('#request-import-file-input', {
+      name: 'not-a-request.json',
+      mimeType: 'application/json',
+      buffer: Buffer.from('{"foo": "bar"}'),
+    });
+    await expect(
+      page.locator("text=That doesn't look like a valid request export."),
+    ).toBeVisible();
+  });
+
+  test('purge all revokes active requests and wipes the local store', async ({
+    page,
+  }) => {
+    // Two pending requests (navigate away in between to remount the form)
+    for (let i = 0; i < 2; i++) {
+      await page.goto('/#/requests');
+      await page.goto('/#/request');
+      await page.click('button:has-text("Create request link")');
+      await expect(page.locator('h2:has-text("Request created")')).toBeVisible({
+        timeout: 15000,
+      });
+    }
+    await page.goto('/#/requests');
+    await expect(
+      page.locator('.badge:has-text("Awaiting secret")'),
+    ).toHaveCount(2);
+    expect(store.size).toBe(2);
+
+    await page.click('button:has-text("Purge all")');
+    await expect(
+      page.locator('h3:has-text("Purge all requests?")'),
+    ).toBeVisible();
+    await page.click('button:has-text("Purge everything")');
+
+    // Server-side requests were revoked and the local list is empty
+    await expect(page.locator('text=No secret requests yet')).toBeVisible();
+    expect(store.size).toBe(0);
+
+    // The old links no longer work
+    await page.goto('/#/r/e2eRequestId000000001/abcdef0123456789');
+    await expect(
+      page.locator('h2:has-text("Request not available")'),
+    ).toBeVisible();
+  });
+});

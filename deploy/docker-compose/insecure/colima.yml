@@ -1,0 +1,8 @@
+services:
+  memcached:
+    ports:
+      - "127.0.0.1:11211:11211"
+
+  secret-share:
+    environment:
+      - PUBLIC_URL=http://localhost:1337

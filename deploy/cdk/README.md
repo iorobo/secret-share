@@ -1,0 +1,94 @@
+# CDK configuration for deploying yopass in AWS.
+
+This is __primarily__ for the project itself and needs alterations to be used in your own setup.
+
+## One-time setup
+
+The stack resolves the yopass license key from SSM Parameter Store at deploy time:
+
+```
+aws ssm put-parameter --name /yopass/license-key --type String --value '<jwt>'
+```
+
+## Deploy
+
+```
+npx cdk deploy
+```
+
+CORS is restricted to the official frontends (`share.yopass.se`,
+`demo.yopass.se`). Origins are configured via the `CORS_ALLOWED_ORIGINS`
+Lambda environment variable in `lib/cdk-stack.ts`; requests from other origins
+receive no `Access-Control-Allow-Origin` header.
+
+### Lambda environment variables
+
+| Variable | Default | Description |
+| --- | --- | --- |
+| `TABLE_NAME` | — | DynamoDB table name |
+| `MAX_LENGTH` | `10000` | Maximum encrypted secret size in bytes; must be positive |
+| `MAX_FILE_SIZE` | `128KB` | Maximum file upload size |
+| `DEFAULT_EXPIRY` | `1h` | Expiration pre-selected in the UI: `1h`, `1d`, or `1w` |
+| `MAX_REQUEST_NOTE_LENGTH` | `1000` | Max characters in the optional plaintext note on a secret request; `0` disables notes, max `10000` |
+| `LICENSE_KEY` | — | Optional yopass license key |
+| `CORS_ALLOWED_ORIGINS` | — | Comma-separated origin allowlist; `*` wildcards stay within one label |
+
+Invalid `MAX_LENGTH`, `MAX_FILE_SIZE`, `DEFAULT_EXPIRY`, `MAX_REQUEST_NOTE_LENGTH`, or `CORS_ALLOWED_ORIGINS`
+values stop the Lambda at startup instead of silently falling back.
+
+```
+GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o ./bootstrap -tags lambda.norpc
+zip deployment.zip bootstrap
+```
+
+The Lambda module uses the repository root module through a local `replace`.
+The checked-in `go.work` keeps the root and Lambda modules in the same
+workspace, so root dependency updates do not force incidental `deploy/cdk`
+`go.mod` churn during tests. Run `go mod tidy` in this directory when its own
+dependencies change, then `go test .` to test the Lambda package without
+traversing Go templates in `node_modules`.
+
+
+The `cdk.json` file tells the CDK Toolkit how to execute your app.
+
+## Useful commands
+
+### DynamoDB security regression tests
+
+Run DynamoDB Local, then run the adapter and HTTP integration tests:
+
+```sh
+docker run --rm -p 127.0.0.1:8000:8000 amazon/dynamodb-local:3.3.0
+# In another terminal, from deploy/cdk:
+DYNAMODB_ENDPOINT=http://localhost:8000 go test . -race
+```
+
+The tests use dummy credentials and temporary tables. They cover exclusive
+one-time claims, expiration before physical TTL cleanup, and concurrent request
+updates and revocation. Without `DYNAMODB_ENDPOINT` these integration tests skip;
+CI supplies it. Use a dedicated local database for tests.
+
+Deploy all Lambda instances with the updated adapter before relying on these
+guarantees: older instances still use unconditional writes and deletion claims.
+Existing records without a revision are supported and receive one on their
+first conditional update. Records with missing or invalid TTL metadata are
+treated as unavailable.
+
+`Dynamo.Update` caps the returned secret's expiration at the record's existing
+absolute expiry. Updates can shorten retention but cannot extend it, including
+time spent processing the mutation. This is stricter than Redis and Memcached,
+which apply the returned `Expiration` as a fresh TTL. Callers must not rely on
+`Database.Update` to extend retention when using this adapter.
+
+### CDK commands
+
+* `npm run build`   compile typescript to js
+* `npm run watch`   watch for changes and compile
+* `npm run test`    perform the jest unit tests
+* `npx cdk deploy`  deploy this stack to your default AWS account/region
+* `npx cdk diff`    compare deployed stack with current state
+* `npx cdk synth`   emits the synthesized CloudFormation template
+
+One-time claims and deletions first replace the record with a unique, secret-free marker, so SDK retries of an applied write can be recognized by the original caller. Markers are removed best-effort and expire after 60 seconds through table TTL if cleanup fails. This adds one small write per claim; markers are never returned as secrets. Conditional updates also recognize their own applied revision after a lost response. If the follow-up read cannot establish ownership, the operation fails closed.
+
+Each DynamoDB call has a two-second deadline covering retries, backoff and transport waits. The Lambda timeout is 29 seconds, leaving time for the handler to finish after a bounded cleanup failure instead of discarding its response at the default three-second limit.
